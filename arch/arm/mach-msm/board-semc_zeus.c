@@ -147,9 +147,21 @@
 #define NOVATEK_GPIO_RESET		157
 #endif
 
+#ifdef CONFIG_MSM_UNDERVOLT_LCD
+#define LCD_VDD_VOLTAGE 2300000
+#else
+#define LCD_VDD_VOLTAGE 2850000
+#endif
+
 #ifdef CONFIG_TOUCHSCREEN_CY8CTMA300
 #define CYPRESS_TOUCH_GPIO_RESET	40
 #define CYPRESS_TOUCH_GPIO_IRQ		42
+#endif
+
+#ifdef CONFIG_MSM_UNDERVOLT_TOUCH
+#define TOUCH_VDD_VOLTAGE 2800000
+#else
+#define TOUCH_VDD_VOLTAGE 3050000
 #endif
 
 #ifdef CONFIG_JOYSTICK_SYNAPTICS
@@ -186,6 +198,49 @@
 #define DDR2_BANK_BASE 0X40000000
 #define DDR2_BANK_SIZE 0X10000000
 
+static unsigned int phys_add = DDR2_BANK_BASE;
+unsigned long ebi1_phys_offset = DDR2_BANK_BASE;
+EXPORT_SYMBOL(ebi1_phys_offset);
+
+static struct regulator *reg;
+
+static int vreg_helper(const char *regName, unsigned uv, int enable)
+{
+	int rc = 0;
+
+	reg = regulator_get(NULL, regName);
+	if (IS_ERR(reg)) {
+		pr_err("%s: get vdd failed\n", __func__);
+		return rc;
+	}
+
+	if (enable) {
+		rc = regulator_set_voltage(reg, uv, uv);
+		if (rc) {
+			pr_err("%s: set voltage failed, rc=%d\n", __func__, rc);
+			goto vreg_configure_err;
+		}
+		rc = regulator_enable(reg);
+		if (rc) {
+			pr_err("%s: enable vdd failed, rc=%d\n", __func__, rc);
+			goto vreg_configure_err;
+		}
+	} else {
+		rc = regulator_set_voltage(reg, 0, uv);
+		if (rc) {
+			pr_err("%s: set voltage failed, rc=%d\n", __func__, rc);
+			goto vreg_configure_err;
+		}
+		rc = regulator_disable(reg);
+		if (rc)
+			pr_err("%s: disable vdd failed, rc=%d\n", __func__, rc);
+	}
+	return rc;
+vreg_configure_err:
+	regulator_put(reg);
+	return rc;
+}
+
 /* GPIO hardware device identification */
 enum board_hwid {
 	BOARD_HWID_UNK,
@@ -202,60 +257,6 @@ enum board_hwid {
 	BOARD_HWID_PQ,
 };
 static u8 board_hwid;
-
-static unsigned int phys_add = DDR2_BANK_BASE;
-unsigned long ebi1_phys_offset = DDR2_BANK_BASE;
-EXPORT_SYMBOL(ebi1_phys_offset);
-
-static int vreg_helper_on(const char *pzName, unsigned mv)
-{
-	struct vreg *reg = NULL;
-	int rc = 0;
-
-	reg = vreg_get(NULL, pzName);
-	if (IS_ERR(reg)) {
-		printk(KERN_ERR "Unable to resolve VREG name \"%s\"\n", pzName);
-		return rc;
-	}
-
-	if (mv != (unsigned int)-1)
-		rc = vreg_set_level(reg, mv);
-
-	if (rc) {
-		printk(KERN_ERR "Unable to set vreg \"%s\" level\n", pzName);
-		return rc;
-	}
-
-	rc = vreg_enable(reg);
-	if (rc) {
-		printk(KERN_ERR "Unable to enable vreg \"%s\" level\n", pzName);
-		return rc;
-	}
-
-	printk(KERN_INFO "Enabled VREG \"%s\" at %u mV\n", pzName, mv);
-	return rc;
-}
-
-static void vreg_helper_off(const char *pzName)
-{
-	struct vreg *reg = NULL;
-	int rc;
-
-	reg = vreg_get(NULL, pzName);
-	if (IS_ERR(reg)) {
-		printk(KERN_ERR "Unable to resolve VREG name \"%s\"\n", pzName);
-		return;
-	}
-
-	rc = vreg_disable(reg);
-	if (rc) {
-		printk(KERN_ERR "Unable to disable vreg \"%s\" level\n",
-			pzName);
-		return;
-	}
-
-	printk(KERN_INFO "Disabled VREG \"%s\"\n", pzName);
-}
 
 #ifdef CONFIG_SEMC_RPC_SERVER_HANDSET
 static struct input_dev *input_dev_pwr_key = NULL;
@@ -662,16 +663,16 @@ static uint32_t camera_on_gpio_table[] = {
 
 static void msm_camera_vreg_enable(void)
 {
-	vreg_helper_on("gp15", 1200); /* L22 */
-	vreg_helper_on("lvsw1", 1800); /* LVS1 */
-	vreg_helper_on("gp2", 2800); /* L11 */
+	vreg_helper("gp15", 1200000, 1); /* L22 */
+	vreg_helper("lvsw1", 1800000, 1); /* LVS1 */
+	vreg_helper("gp2", 2800000, 1); /* L11 */
 }
 
 static void msm_camera_vreg_disable(void)
 {
-	vreg_helper_off("gp2");
-	vreg_helper_off("lvsw1");
-	vreg_helper_off("gp15");
+	vreg_helper("gp15", 1200000, 0); /* L22 */
+	vreg_helper("lvsw1", 1800000, 0); /* LVS1 */
+	vreg_helper("gp2", 2800000, 0); /* L11 */
 }
 
 static void config_gpio_table(uint32_t *table, int len)
@@ -1716,12 +1717,12 @@ static int novatek_power(int on)
 
 	if (on) {
 		if (!enabled_once) {
-			rc = vreg_helper_on("gp6", 2850);
+			rc = vreg_helper("gp6", LCD_VDD_VOLTAGE, 1);
 			if (rc)
 				goto out;
-			rc = vreg_helper_on("gp9", 1800);
+			rc = vreg_helper("gp9", 1800000, 1);
 			if (rc) {
-				vreg_helper_off("gp6");
+				vreg_helper("gp6", LCD_VDD_VOLTAGE, 0);
 				goto out;
 			}
 			hr_usleep(21); /* spec says > 20us */
@@ -1784,7 +1785,7 @@ void charger_connected(int on)
 
 static void cypress_touch_gpio_init(void)
 {
-	vreg_helper_on("gp13", 3000);
+	vreg_helper("gp13", TOUCH_VDD_VOLTAGE, 1);
 
 	/* Avoid writing firmward on SP3 */
 	if (BOARD_HWID_SP3 == board_hwid)
@@ -2783,7 +2784,7 @@ msm_i2c_gpio_config(int adap_id, int config_type)
 		msm_i2c_table = &msm_i2c_gpios_io[adap_id*2];
 	msm_gpios_enable(msm_i2c_table, 2);
 
-	vreg_helper_on("gp7", 1800);
+	vreg_helper("gp7", 1800000, 1);
 }
 
 static void
@@ -3259,10 +3260,10 @@ static void __init zeus_temp_fixups(void)
 				GPIO_CFG_ENABLE);
 
 	/* Since the sequencing for AKM & BMA needs to be L10 -> L8 */
-	vreg_helper_on("gp4", 2850);	/* L10 */
+	vreg_helper("gp4", 2850000, 1);  /* L10: BMA150, AK8975B */
 
-	vreg_helper_on("wlan", 1800);	/* L13: touchpad VDIO */
-	vreg_helper_on("gp10", 2800);	/* L16: touchpad */
+	vreg_helper("wlan", 1800000, 1);  /* L13: touchpad VDIO */
+	vreg_helper("gp10", 2800000, 1);  /* L16: touchpad */
 }
 
 static void __init msm7x30_init_nand(void)
